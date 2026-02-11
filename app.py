@@ -7,21 +7,20 @@ from datetime import datetime, timedelta
 # --- CONFIGURATION INITIALE ---
 st.set_page_config(page_title="Global Macro Dashboard", layout="wide")
 
-# --- GESTION DE LA CLÉ API SÉCURISÉE ---
+# Gestion de la clé API
 if "FRED_KEY" in st.secrets:
     API_KEY = st.secrets["FRED_KEY"]
 else:
-    # Clé de secours pour vos tests locaux
-    API_KEY = 'f25835309cd5c99504970cd7f417dddd'
+    API_KEY = 'f25835309cd5c99504970cd7f417dddd' # Votre clé
 
-# Initialisation de l'objet FRED
 try:
     fred = Fred(api_key=API_KEY)
 except Exception as e:
-    st.error(f"Erreur de connexion API : {e}")
+    st.error(f"Erreur API : {e}")
     st.stop()
 
-# --- DEFINITION DES INDICES ---
+# --- DICTIONNAIRE DE SÉRIES RÉVISÉ (Plus robuste) ---
+# J'ai utilisé des séries "Immediate Rates" (Interbancaire) qui sont mieux mises à jour
 central_banks = {
     'USD (Fed)': {
         'rate': 'FEDFUNDS',             
@@ -34,201 +33,133 @@ central_banks = {
         'balance': 'ECBASSETSW'         
     },
     'JPY (BoJ)': {
-        'rate': 'INTDSRJPM193N',        
+        'rate': 'IRSTCI01JPM156N', # Taux interbancaire JPY (Plus récent)
         'cpi': 'JPNCPIALLMINMEI',       
         'balance': 'JPNASSETS'          
     },
     'GBP (BoE)': {
-        'rate': 'IUDSOIA',              
+        'rate': 'IUDSOIA', # SONIA Rate (Très réactif)
         'cpi': 'GBRCPIALLMINMEI',       
         'balance': None                 
     },
     'CAD (BoC)': {
-        'rate': 'INTDSRCAM193N',        
+        'rate': 'IRSTCI01CAM156N', # Taux interbancaire CAD
         'cpi': 'CANCPIALLMINMEI',       
         'balance': 'CV11269'            
     },
     'AUD (RBA)': {
-        'rate': 'INTDSRAUM193N',        
+        'rate': 'IRSTCI01AUM156N', # Taux interbancaire AUD
         'cpi': 'AUSCPIALLMINMEI',       
         'balance': None
     },
     'CHF (SNB)': {
-        'rate': 'INTDSRCHM193N',        
+        'rate': 'IRSTCI01CHM156N', # Taux interbancaire CHF
         'cpi': 'CHECPIALLMINMEI',       
         'balance': 'CHFCENTRALBANK'     
     },
 }
 
-# --- FONCTIONS DE CALCUL (BACKEND) ---
+# --- LOGIQUE DE CALCUL ---
 
 def calculate_z_score(series):
-    """Calcule le Z-Score (écart à la moyenne en écarts-types)"""
-    if series is None or len(series) < 10: 
-        return 0
-    clean_series = series.dropna()
-    if clean_series.empty:
-        return 0
-    mean = clean_series.mean()
-    std = clean_series.std()
-    if std == 0: 
-        return 0
-    return (clean_series.iloc[-1] - mean) / std
+    if series is None or len(series) < 5: return 0
+    clean = series.dropna()
+    if clean.empty: return 0
+    return (clean.iloc[-1] - clean.mean()) / clean.std()
 
-@st.cache_data(ttl=3600*24)
+@st.cache_data(ttl=3600*12)
 def get_macro_data():
-    """Télécharge et traite les données macro-économiques"""
     data = []
-    start_date = datetime.now() - timedelta(days=365*5) # 5 ans d'historique
+    start_date = datetime.now() - timedelta(days=365*5)
     
-    progress_bar = st.progress(0, text="Connexion aux serveurs de la FED...")
-    total = len(central_banks)
-
+    progress_bar = st.progress(0, text="Interrogation de la FRED...")
+    
     for i, (currency, codes) in enumerate(central_banks.items()):
+        row = {'Devise': currency, 'Taux (%)': 0, 'Z-Rate': 0, 'CPI (%)': 0, 'Z-CPI': 0, 
+               'Bilan 6M (%)': 0, 'Z-Bilan': 0, 'Macro Score': 0, 'Status': '✅'}
+        
         try:
-            # 1. TAUX DIRECTEUR
-            rate_s = fred.get_series(codes['rate'], observation_start=start_date).ffill()
-            if rate_s.empty: continue
-            cur_rate = rate_s.iloc[-1]
-            z_rate = calculate_z_score(rate_s)
+            # 1. TAUX (Indispensable)
+            try:
+                rate_s = fred.get_series(codes['rate'], observation_start=start_date).ffill()
+                row['Taux (%)'] = rate_s.iloc[-1]
+                row['Z-Rate'] = calculate_z_score(rate_s)
+            except:
+                row['Status'] = '❌ Taux manquant'
+                data.append(row)
+                continue
 
-            # 2. INFLATION (CPI)
-            cpi_s = fred.get_series(codes['cpi'], observation_start=start_date).ffill()
-            # Calcul de la variation annuelle (YoY)
-            cpi_yoy = cpi_s.pct_change(12).dropna() * 100
-            cur_cpi = cpi_yoy.iloc[-1] if not cpi_yoy.empty else 0
-            z_cpi = calculate_z_score(cpi_yoy)
+            # 2. CPI (Optionnel pour le calcul)
+            try:
+                cpi_s = fred.get_series(codes['cpi'], observation_start=start_date).ffill()
+                cpi_yoy = cpi_s.pct_change(12).dropna() * 100
+                row['CPI (%)'] = cpi_yoy.iloc[-1]
+                row['Z-CPI'] = calculate_z_score(cpi_yoy)
+            except:
+                row['Status'] = '⚠️ CPI manquant'
 
-            # 3. BILAN (Balance Sheet)
-            cur_bs_chg = 0
-            z_bs = 0
+            # 3. BILAN (Optionnel)
             if codes['balance']:
                 try:
                     bs_s = fred.get_series(codes['balance'], observation_start=start_date).ffill()
-                    # Variation sur env. 6 mois (26 semaines ou 6 mois)
-                    # On utilise un décalage relatif à la longueur de la série
-                    shift = 26 if len(bs_s) > 100 else 6 
-                    bs_chg = bs_s.pct_change(shift).dropna() * 100
-                    cur_bs_chg = bs_chg.iloc[-1]
-                    z_bs = calculate_z_score(bs_chg)
+                    bs_chg = bs_s.pct_change(26).dropna() * 100 # 6 mois approx
+                    row['Bilan 6M (%)'] = bs_chg.iloc[-1]
+                    row['Z-Bilan'] = calculate_z_score(bs_chg)
                 except:
                     pass
 
-            # 4. ALGORITHME DE SCORING (Hawk vs Dove)
-            # Poids : Taux (x2), Inflation (x1), Bilan (-0.5 car expansion = Dovish)
-            score = (z_rate * 2.0) + (z_cpi * 1.0) - (z_bs * 0.5)
-
-            data.append({
-                'Devise': currency,
-                'Taux (%)': round(cur_rate, 2),
-                'Z-Rate': z_rate,
-                'CPI (%)': round(cur_cpi, 2),
-                'Z-CPI': z_cpi,
-                'Bilan 6M (%)': round(cur_bs_chg, 2),
-                'Z-Bilan': z_bs,
-                'Macro Score': score
-            })
+            # Score : Hawk (Taux+CPI) vs Dove (Bilan)
+            row['Macro Score'] = (row['Z-Rate'] * 2.0) + (row['Z-CPI'] * 1.0) - (row['Z-Bilan'] * 0.5)
+            data.append(row)
 
         except Exception as e:
-            st.warning(f"Données incomplètes pour {currency}")
-            continue
-        
-        progress_bar.progress((i + 1) / total, text=f"Chargement : {currency}")
+            row['Status'] = f"❌ Erreur: {str(e)[:20]}"
+            data.append(row)
+            
+        progress_bar.progress((i + 1) / len(central_banks))
 
     progress_bar.empty()
-    df = pd.DataFrame(data)
-    return df.sort_values(by='Macro Score', ascending=False)
+    return pd.DataFrame(data).sort_values(by='Macro Score', ascending=False)
 
-# --- INTERFACE (FRONTEND) ---
+# --- INTERFACE ---
 
 st.title("🏦 Central Bank Alpha Tool")
-st.markdown(f"**Status:** Live | **Source:** FRED/FMI | **Dernier Refresh:** {datetime.now().strftime('%H:%M')}")
+st.info("Note : Les données hors USA peuvent avoir un délai de mise à jour (Source FRED/OCDE).")
 
-# Chargement des données
-with st.spinner('Analyse des cycles monétaires en cours...'):
-    df = get_macro_data()
+if st.button('🔄 Forcer le rafraîchissement des données'):
+    st.cache_data.clear()
+    st.rerun()
 
-if not df.empty:
-    # SECTION 1 : TABLEAU DE BORD
-    st.header("1. Tableau de Bord Macro")
-    
-    col1, col2 = st.columns([3, 1])
+df = get_macro_data()
 
-    with col1:
-        # Fonction de style corrigée pour Pandas 2.x
-        def highlight_scores(val):
-            if not isinstance(val, (int, float)): return ''
-            if val > 1.2: return 'background-color: #d4edda; color: #155724; font-weight: bold' # Vert
-            if val < -1.2: return 'background-color: #f8d7da; color: #721c24; font-weight: bold' # Rouge
-            return ''
+# Affichage du tableau
+st.header("1. Analyse Comparative")
 
-        # Affichage du DataFrame avec formatage
-        st.dataframe(
-            df.style.map(highlight_scores, subset=['Z-Rate', 'Z-CPI', 'Z-Bilan', 'Macro Score'])
-            .format("{:.2f}", subset=['Z-Rate', 'Z-CPI', 'Z-Bilan', 'Macro Score']),
-            use_container_width=True,
-            height=350
-        )
+def style_df(val):
+    if not isinstance(val, (int, float)): return ''
+    if val > 1.2: return 'background-color: #d4edda; color: #155724'
+    if val < -1.2: return 'background-color: #f8d7da; color: #721c24'
+    return ''
 
-    with col2:
-        best = df.iloc[0]
-        worst = df.iloc[-1]
-        
-        st.success(f"🔥 **HAWKISH** (Long)\n\n**{best['Devise']}**")
-        st.error(f"🌊 **DOVISH** (Short)\n\n**{worst['Devise']}**")
-        
-        spread = best['Macro Score'] - worst['Macro Score']
-        st.metric("Potentiel de Divergence", f"{spread:.2f}")
+st.dataframe(
+    df.style.map(style_df, subset=['Z-Rate', 'Z-CPI', 'Z-Bilan', 'Macro Score'])
+    .format("{:.2f}", subset=['Taux (%)', 'Z-Rate', 'CPI (%)', 'Z-CPI', 'Bilan 6M (%)', 'Z-Bilan', 'Macro Score']),
+    use_container_width=True
+)
 
-    # SECTION 2 : VISUALISATION
-    st.divider()
-    st.header("2. Analyse des Cycles (Z-Score Map)")
-    
-    col_chart1, col_chart2 = st.columns([2, 1])
+# Graphique
+st.header("2. Positionnement Hawkish vs Dovish")
+fig = px.scatter(df, x="Z-CPI", y="Z-Rate", text="Devise", color="Macro Score",
+                 size=[20]*len(df), color_continuous_scale="RdYlGn",
+                 labels={"Z-CPI": "Inflation (Z-Score)", "Z-Rate": "Taux (Z-Score)"})
+fig.add_hline(y=0, line_dash="dash")
+fig.add_vline(x=0, line_dash="dash")
+st.plotly_chart(fig, use_container_width=True)
 
-    with col_chart1:
-        fig = px.scatter(
-            df, x="Z-CPI", y="Z-Rate", text="Devise", 
-            size=[20]*len(df), color="Macro Score",
-            color_continuous_scale="RdYlGn",
-            labels={"Z-CPI": "Inflation (Z-Score)", "Z-Rate": "Taux (Z-Score)"},
-            title="Divergence : Taux vs Inflation"
-        )
-        fig.add_hline(y=0, line_dash="dash", line_color="grey")
-        fig.add_vline(x=0, line_dash="dash", line_color="grey")
-        fig.update_traces(textposition='top center')
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col_chart2:
-        st.info("""
-        **Comment interpréter ?**
-        - **Haut-Droite** : La banque centrale est agressive (Taux hauts) pour contrer une inflation forte. Devise généralement forte.
-        - **Bas-Droite** : "Behind the curve". Inflation forte mais taux bas. Risque de dévaluation.
-        - **Bas-Gauche** : Politique expansionniste. Taux bas et peu d'inflation. Devise de financement (Carry).
-        """)
-
-    # SECTION 3 : OPPORTUNITÉS FOREX
-    st.divider()
-    st.header("3. Signaux de Divergence")
-
-    trades = []
-    for i, row_l in df.iterrows():
-        for j, row_s in df.iterrows():
-            spread = row_l['Macro Score'] - row_s['Macro Score']
-            if spread > 2.0: # Seuil de divergence forte
-                pair = f"{row_l['Devise'][:3]}/{row_s['Devise'][:3]}"
-                trades.append({
-                    'Paire': pair,
-                    'Action': 'ACHAT (Long)',
-                    'Force du Signal': round(spread, 2),
-                    'Logique': "Divergence Politique Monétaire"
-                })
-
-    if trades:
-        df_trades = pd.DataFrame(trades).sort_values(by='Force du Signal', ascending=False)
-        st.table(df_trades.head(5))
-    else:
-        st.write("Pas de divergence majeure détectée pour le moment.")
-
-else:
-    st.error("Impossible de charger les données. Vérifiez votre clé API FRED.")
+# Signaux
+st.header("3. Signaux Forex")
+col1, col2 = st.columns(2)
+with col1:
+    st.success(f"🔥 Plus Hawkish : {df.iloc[0]['Devise']}")
+with col2:
+    st.error(f"🌊 Plus Dovish : {df.iloc[-1]['Devise']}")
